@@ -136,13 +136,15 @@ function normalizeBeats(
 }
 
 async function createPlayableAudioUrl(
-  wavBytes: Uint8Array
+  wavBytes: Uint8Array,
+  signal?: AbortSignal
 ): Promise<{ url: string; isBlob: boolean }> {
   try {
     const res = await fetch('/api/audio/cache', {
       method: 'POST',
       headers: { 'Content-Type': 'audio/wav' },
       body: wavBytesToBlob(wavBytes),
+      signal,
     });
     if (res.ok) {
       const data = (await res.json()) as { url?: string };
@@ -150,7 +152,10 @@ async function createPlayableAudioUrl(
         return { url: data.url, isBlob: false };
       }
     }
-  } catch {
+  } catch (err: unknown) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw err;
+    }
     // Fall back to local blob URL
   }
   return { url: URL.createObjectURL(wavBytesToBlob(wavBytes)), isBlob: true };
@@ -209,9 +214,12 @@ export default function App() {
   const [activeTakeId, setActiveTakeId] = useState<string | null>(null);
   const takeCounterRef = useRef<number>(0);
 
-  // Beat audition HTML5 audio player
+  // Beat audition HTML5 audio player + live ref for clean state updates
   const beatHtmlAudioRef = useRef<HTMLAudioElement | null>(null);
   const beatBlobUrlRef = useRef<string | null>(null);
+  const beatPlayRequestIdRef = useRef<number>(0);
+  const beatAudiosRef = useRef<Record<string, BeatAudioState>>({});
+  const lastProcessedRawNonceRef = useRef<number>(0);
   const [playingBeatId, setPlayingBeatId] = useState<string | null>(null);
 
   // E-com fast workflow panels
@@ -315,65 +323,109 @@ export default function App() {
       builtInSource.voicePersonaOverride !== activeProject.voicePersonaOverride ||
       builtInSource.formatId !== activeProject.formatId ||
       builtInSource.styleId !== activeProject.styleId ||
-      builtInSource.dialectId !== activeProject.dialectId
+      builtInSource.dialectId !== activeProject.dialectId ||
+      builtInSource.voiceName !== activeProject.voiceName ||
+      builtInSource.paceId !== activeProject.paceId
     );
   }, [builtInSource, activeProject]);
 
-  // Apply real-time local loudness mastering DSP and publish a clean same-origin HTTPS audio URL (0 TTS API calls!)
   useEffect(() => {
-    if (!rawMasterWavBytes) return;
-    let cancelled = false;
-
-    const mastered = applyAudioMastering(rawMasterWavBytes, {
-      preset: loudnessPreset,
-      gainDb,
-      trimSilence,
-    });
-    const peaks = extractWaveformPeaks(mastered.wavBytes, 150);
-    const shiftedMarkers = rawMasterMarkers.map((m) => ({
-      ...m,
-      startSec: Math.max(0, m.startSec - mastered.trimmedStartSec),
-      endSec: Math.min(
-        mastered.durationSec,
-        Math.max(0, m.endSec - mastered.trimmedStartSec)
-      ),
-    }));
-
-    URL.revokeObjectURL(mastered.blobUrl);
-    setMasterWavBytes(mastered.wavBytes);
-    setMasterPeaks(peaks);
-    setMasterDuration(mastered.durationSec);
-    setMasterSampleRate(mastered.sampleRate);
-    setMasterPeakDbfs(mastered.peakDbfs);
-    setMasterRmsDbfs(mastered.rmsDbfs);
-    setMasterMarkers(shiftedMarkers);
-
-    void createPlayableAudioUrl(mastered.wavBytes).then(({ url, isBlob }) => {
-      if (cancelled) {
-        if (isBlob) URL.revokeObjectURL(url);
-        return;
-      }
-      const prevBlob = masterFallbackBlobRef.current;
-      masterFallbackBlobRef.current = isBlob ? url : null;
-      setMasterAudioUrl(url);
-      setMasterGenNonce(rawMasterNonce);
-      if (prevBlob) {
-        setTimeout(() => URL.revokeObjectURL(prevBlob), 1000);
-      }
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [rawMasterWavBytes, rawMasterMarkers, rawMasterNonce, loudnessPreset, gainDb, trimSilence]);
+    beatAudiosRef.current = beatAudios;
+  }, [beatAudios]);
 
   const stopBeatPreview = useCallback(() => {
+    beatPlayRequestIdRef.current += 1;
     if (beatHtmlAudioRef.current) {
       beatHtmlAudioRef.current.pause();
       beatHtmlAudioRef.current.currentTime = 0;
     }
     setPlayingBeatId(null);
   }, []);
+
+  const clearMasterDeck = useCallback(() => {
+    stopBeatPreview();
+    setStopMasterSignal((n) => n + 1);
+    setRawMasterWavBytes(null);
+    setRawMasterMarkers([]);
+    setMasterAudioUrl(null);
+    setMasterWavBytes(null);
+    setMasterPeaks([]);
+    setMasterDuration(0);
+    setMasterPeakDbfs(null);
+    setMasterRmsDbfs(null);
+    setMasterMarkers([]);
+    setActiveBeatId(null);
+    setActiveTakeId(null);
+    setSeekRequest(null);
+  }, [stopBeatPreview]);
+
+  // Apply real-time local loudness mastering DSP and publish a clean same-origin HTTPS audio URL (0 TTS API calls!)
+  useEffect(() => {
+    if (!rawMasterWavBytes) return;
+
+    const isFreshMaster = rawMasterNonce !== lastProcessedRawNonceRef.current;
+    const delayMs = isFreshMaster ? 0 : 140;
+    const controller = new AbortController();
+    let cancelled = false;
+
+    const runMastering = () => {
+      if (cancelled) return;
+      lastProcessedRawNonceRef.current = rawMasterNonce;
+
+      const mastered = applyAudioMastering(rawMasterWavBytes, {
+        preset: loudnessPreset,
+        gainDb,
+        trimSilence,
+      });
+      const peaks = extractWaveformPeaks(mastered.wavBytes, 150);
+      const shiftedMarkers = rawMasterMarkers.map((m) => ({
+        ...m,
+        startSec: Math.max(0, m.startSec - mastered.trimmedStartSec),
+        endSec: Math.min(
+          mastered.durationSec,
+          Math.max(0, m.endSec - mastered.trimmedStartSec)
+        ),
+      }));
+
+      URL.revokeObjectURL(mastered.blobUrl);
+      setMasterWavBytes(mastered.wavBytes);
+      setMasterPeaks(peaks);
+      setMasterDuration(mastered.durationSec);
+      setMasterSampleRate(mastered.sampleRate);
+      setMasterPeakDbfs(mastered.peakDbfs);
+      setMasterRmsDbfs(mastered.rmsDbfs);
+      setMasterMarkers(shiftedMarkers);
+
+      void createPlayableAudioUrl(mastered.wavBytes, controller.signal)
+        .then(({ url, isBlob }) => {
+          if (cancelled) {
+            if (isBlob) URL.revokeObjectURL(url);
+            return;
+          }
+          const prevBlob = masterFallbackBlobRef.current;
+          masterFallbackBlobRef.current = isBlob ? url : null;
+          setMasterAudioUrl(url);
+          setMasterGenNonce(rawMasterNonce);
+          if (prevBlob) {
+            setTimeout(() => URL.revokeObjectURL(prevBlob), 1000);
+          }
+        })
+        .catch(() => {
+          // Aborted by newer mastering pass
+        });
+    };
+
+    const timerId = delayMs > 0 ? window.setTimeout(runMastering, delayMs) : null;
+    if (delayMs === 0) {
+      runMastering();
+    }
+
+    return () => {
+      cancelled = true;
+      if (timerId !== null) window.clearTimeout(timerId);
+      controller.abort();
+    };
+  }, [rawMasterWavBytes, rawMasterMarkers, rawMasterNonce, loudnessPreset, gainDb, trimSilence]);
 
   useEffect(() => {
     return () => {
@@ -425,8 +477,15 @@ export default function App() {
       }
 
       if (payload.fallbackFrom) {
+        const fromLabel =
+          MODEL_OPTIONS.find((m) => m.id === payload.fallbackFrom)?.label ??
+          payload.fallbackFrom;
+        const toLabel =
+          MODEL_OPTIONS.find((m) => m.id === payload.model)?.label ??
+          payload.model ??
+          'alternate TTS engine';
         setInfoNotice(
-          'Flash TTS reached its free-tier daily quota (10 requests/day) — synthesized automatically with Flash Lite TTS.'
+          `${fromLabel} reached its free-tier daily quota — synthesized automatically with ${toLabel}.`
         );
       }
 
@@ -475,6 +534,7 @@ export default function App() {
         gainDb,
         trimSilence,
       });
+      URL.revokeObjectURL(mastered.blobUrl);
       const peaks = extractWaveformPeaks(mastered.wavBytes, 150);
       const effectiveModelLabel =
         MODEL_OPTIONS.find((m) => m.id === params.effectiveModel)?.label ?? modelLabel;
@@ -500,7 +560,7 @@ export default function App() {
         sampleRate: mastered.sampleRate,
         rawWavBytes: params.rawBytes,
         wavBytes: mastered.wavBytes,
-        blobUrl: mastered.blobUrl,
+        blobUrl: '',
         peaks,
         markers: params.markers,
       };
@@ -566,6 +626,10 @@ export default function App() {
 
   const handleSynthesizeSingleBeat = useCallback(
     async (beat: ScriptBeat) => {
+      if (!beat.text.trim()) {
+        setErrorMessage('Add script text to this beat before rendering.');
+        return;
+      }
       setErrorMessage(null);
       setInfoNotice(null);
       setGeneratingBeatIds((prev) => ({ ...prev, [beat.id]: true }));
@@ -573,36 +637,34 @@ export default function App() {
       try {
         const combinedStyle = `${effectivePersona}\n\nBeat Direction (${beat.actLabel}): ${beat.direction.trim()}`;
         const { wavBytes, effectiveModel } = await callSynthesizeApi([
-          { text: beat.text, style: combinedStyle },
+          { text: beat.text.trim(), style: combinedStyle },
         ]);
-        const masteredBeat = applyAudioMastering(wavBytes, {
-          preset: loudnessPreset,
-          gainDb,
-          trimSilence: false,
-        });
+        const parsed = parseWavBuffer(wavBytes);
 
         const newBeatAudio: BeatAudioState = {
           wavBytes,
-          blobUrl: masteredBeat.blobUrl,
-          durationSec: masteredBeat.durationSec,
+          blobUrl: '',
+          durationSec: parsed.durationSec,
           voiceName: activeProject.voiceName,
           model: effectiveModel,
         };
 
-        setBeatAudios((prev) => {
-          const nextMap = { ...prev, [beat.id]: newBeatAudio };
-          const allRendered = activeProject.beats.every((b) => Boolean(nextMap[b.id]));
-          if (allRendered) {
-            buildMasterFromBeatMap(
-              activeProject.beats,
-              nextMap,
-              globalPauseScale,
-              true,
-              effectiveModel
-            );
-          }
-          return nextMap;
-        });
+        const nextMap = { ...beatAudiosRef.current, [beat.id]: newBeatAudio };
+        beatAudiosRef.current = nextMap;
+        setBeatAudios(nextMap);
+
+        const nonEmptyBeats = activeProject.beats.filter((b) => b.text.trim().length > 0);
+        const allRendered =
+          nonEmptyBeats.length > 0 && nonEmptyBeats.every((b) => Boolean(nextMap[b.id]));
+        if (allRendered) {
+          buildMasterFromBeatMap(
+            nonEmptyBeats,
+            nextMap,
+            globalPauseScale,
+            true,
+            effectiveModel
+          );
+        }
       } catch (err: unknown) {
         setErrorMessage(
           err instanceof Error ? err.message : 'Unable to synthesize this beat.'
@@ -614,8 +676,6 @@ export default function App() {
     [
       effectivePersona,
       callSynthesizeApi,
-      loudnessPreset,
-      gainDb,
       activeProject.voiceName,
       activeProject.beats,
       buildMasterFromBeatMap,
@@ -700,16 +760,16 @@ export default function App() {
             ]);
             lastEffectiveModel = effectiveModel;
             const parsed = parseWavBuffer(wavBytes);
-            const blobUrl = URL.createObjectURL(wavBytesToBlob(wavBytes));
 
             nextMap[beat.id] = {
               wavBytes,
-              blobUrl,
+              blobUrl: '',
               durationSec: parsed.durationSec,
               voiceName: activeProject.voiceName,
               model: effectiveModel,
             };
 
+            beatAudiosRef.current = { ...nextMap };
             setBeatAudios({ ...nextMap });
           } finally {
             setGeneratingBeatIds((prev) => ({ ...prev, [beat.id]: false }));
@@ -790,6 +850,7 @@ export default function App() {
           updatedAt: Date.now(),
         };
 
+        clearMasterDeck();
         setProjects((prev) => [newProject, ...prev]);
         setActiveProjectId(newProject.id);
         setBeatAudios({});
@@ -806,7 +867,7 @@ export default function App() {
         setBusyAssistAction(null);
       }
     },
-    [callScriptAssistApi, activeProject.voiceName]
+    [callScriptAssistApi, activeProject.voiceName, clearMasterDeck]
   );
 
   const handlePasteSplit = useCallback(async () => {
@@ -829,11 +890,13 @@ export default function App() {
         throw new Error('Could not split this script into beats.');
       }
 
+      clearMasterDeck();
       updateActiveProject((proj) => ({
         ...proj,
         beats: normalizeBeats(res.beats!),
       }));
       setBeatAudios({});
+      setHookVariants(null);
       setShowPastePanel(false);
       setRawPasteText('');
       setInfoNotice(
@@ -852,15 +915,20 @@ export default function App() {
     activeFormat.targetSeconds,
     activeStyle.label,
     updateActiveProject,
+    clearMasterDeck,
   ]);
 
   const handleTightenToTarget = useCallback(async () => {
+    const fullText = activeProject.beats.map((b) => b.text.trim()).filter(Boolean).join('\n\n');
+    if (!fullText) {
+      setErrorMessage('Add script text before tightening to target length.');
+      return;
+    }
     setErrorMessage(null);
     setInfoNotice(null);
     setBusyAssistAction('tighten');
 
     try {
-      const fullText = activeProject.beats.map((b) => b.text.trim()).join('\n\n');
       const res = await callScriptAssistApi({
         mode: 'tighten',
         rawScript: fullText,
@@ -874,12 +942,14 @@ export default function App() {
         throw new Error('Could not tighten script right now.');
       }
 
+      clearMasterDeck();
       updateActiveProject((proj) => ({
         ...proj,
         paceId: activeFormat.targetSeconds <= 115 ? 'brisk' : proj.paceId,
         beats: normalizeBeats(res.beats!),
       }));
       setBeatAudios({});
+      setHookVariants(null);
       setInfoNotice(
         `Tightened script for ${activeFormat.label} (${activeFormat.durationBadge}) and switched pace to Brisk.`
       );
@@ -897,14 +967,19 @@ export default function App() {
     activeFormat.targetSeconds,
     activeStyle.label,
     updateActiveProject,
+    clearMasterDeck,
   ]);
 
   const handleGenerateHooks = useCallback(async () => {
+    const fullText = activeProject.beats.map((b) => b.text.trim()).filter(Boolean).join('\n\n');
+    if (!fullText) {
+      setErrorMessage('Add script text before generating hook variations.');
+      return;
+    }
     setErrorMessage(null);
     setBusyAssistAction('hooks');
 
     try {
-      const fullText = activeProject.beats.map((b) => b.text.trim()).join('\n\n');
       const res = await callScriptAssistApi({
         mode: 'hooks',
         rawScript: fullText,
@@ -932,6 +1007,18 @@ export default function App() {
 
   const handleApplyHookVariant = useCallback(
     (hook: HookVariant) => {
+      const firstBeatId = activeProject.beats[0]?.id;
+      if (firstBeatId) {
+        if (playingBeatId === firstBeatId) {
+          stopBeatPreview();
+        }
+        setBeatAudios((prev) => {
+          if (!prev[firstBeatId]) return prev;
+          const next = { ...prev };
+          delete next[firstBeatId];
+          return next;
+        });
+      }
       updateActiveProject((proj) => {
         const nextBeats = proj.beats.map((b, idx) =>
           idx === 0
@@ -946,24 +1033,34 @@ export default function App() {
       });
       setInfoNotice(`Swapped Beat 1 to "${hook.angle}" hook — click Generate Voice-Over to test.`);
     },
-    [updateActiveProject]
+    [activeProject.beats, playingBeatId, stopBeatPreview, updateActiveProject]
   );
 
   // Beat editing handlers
   const handleUpdateBeat = useCallback(
     (id: string, patch: Partial<ScriptBeat>) => {
-      updateActiveProject((proj) => {
-        const updated = proj.beats.map((b) => (b.id === id ? { ...b, ...patch } : b));
-        if (
-          patch.pauseAfterMs !== undefined &&
-          updated.every((b) => Boolean(beatAudios[b.id]))
-        ) {
-          buildMasterFromBeatMap(updated, beatAudios, globalPauseScale, false);
-        }
-        return { ...proj, beats: updated };
-      });
+      const updated = activeProject.beats.map((b) =>
+        b.id === id ? { ...b, ...patch } : b
+      );
+      updateActiveProject((proj) => ({
+        ...proj,
+        beats: proj.beats.map((b) => (b.id === id ? { ...b, ...patch } : b)),
+      }));
+      const nonEmptyUpdated = updated.filter((b) => b.text.trim().length > 0);
+      if (
+        patch.pauseAfterMs !== undefined &&
+        nonEmptyUpdated.length > 0 &&
+        nonEmptyUpdated.every((b) => Boolean(beatAudiosRef.current[b.id]))
+      ) {
+        buildMasterFromBeatMap(
+          nonEmptyUpdated,
+          beatAudiosRef.current,
+          globalPauseScale,
+          false
+        );
+      }
     },
-    [updateActiveProject, beatAudios, buildMasterFromBeatMap, globalPauseScale]
+    [activeProject.beats, updateActiveProject, buildMasterFromBeatMap, globalPauseScale]
   );
 
   const handleAddBeat = useCallback(() => {
@@ -990,6 +1087,15 @@ export default function App() {
 
   const handleDeleteBeat = useCallback(
     (beatId: string) => {
+      if (playingBeatId === beatId) {
+        stopBeatPreview();
+      }
+      setBeatAudios((prev) => {
+        if (!prev[beatId]) return prev;
+        const next = { ...prev };
+        delete next[beatId];
+        return next;
+      });
       updateActiveProject((proj) => {
         if (proj.beats.length <= 1) return proj;
         const filtered = proj.beats
@@ -1004,22 +1110,24 @@ export default function App() {
         return { ...proj, beats: filtered };
       });
     },
-    [updateActiveProject]
+    [playingBeatId, stopBeatPreview, updateActiveProject]
   );
 
   // Project management
   const handleSelectProject = useCallback(
     (projectId: string) => {
-      stopBeatPreview();
+      if (projectId === activeProjectId) return;
+      clearMasterDeck();
       setActiveProjectId(projectId);
       setBeatAudios({});
       setHookVariants(null);
       setShowPastePanel(false);
     },
-    [stopBeatPreview]
+    [activeProjectId, clearMasterDeck]
   );
 
   const handleCreateBlankProject = useCallback(() => {
+    clearMasterDeck();
     const newProj: AdProject = {
       id: `proj-${Date.now()}`,
       name: `New E-Com Spot (${projects.length + 1})`,
@@ -1056,11 +1164,13 @@ export default function App() {
     setProjects((prev) => [newProj, ...prev]);
     setActiveProjectId(newProj.id);
     setBeatAudios({});
+    setHookVariants(null);
     setShowPastePanel(true);
     setActiveTab('studio');
-  }, [projects.length, activeProject.dialectId, activeProject.voiceName]);
+  }, [projects.length, activeProject.dialectId, activeProject.voiceName, clearMasterDeck]);
 
   const handleDuplicateProject = useCallback(() => {
+    clearMasterDeck();
     const copy: AdProject = {
       ...cloneProject(activeProject),
       id: `proj-${Date.now()}`,
@@ -1071,8 +1181,9 @@ export default function App() {
     setProjects((prev) => [copy, ...prev]);
     setActiveProjectId(copy.id);
     setBeatAudios({});
+    setHookVariants(null);
     setInfoNotice(`Duplicated project as "${copy.name}" for A/B testing.`);
-  }, [activeProject]);
+  }, [activeProject, clearMasterDeck]);
 
   const handleDeleteProject = useCallback(
     (projectId: string) => {
@@ -1080,30 +1191,39 @@ export default function App() {
       if (!target || target.isBuiltIn) return;
       const remaining = projects.filter((p) => p.id !== projectId);
       setProjects(remaining);
-      setActiveProjectId(remaining[0]?.id || 'fenoa-mini-vsl');
-      setBeatAudios({});
+      if (projectId === activeProjectId) {
+        clearMasterDeck();
+        setActiveProjectId(remaining[0]?.id || 'fenoa-mini-vsl');
+        setBeatAudios({});
+        setHookVariants(null);
+      }
     },
-    [projects]
+    [projects, activeProjectId, clearMasterDeck]
   );
 
   const handleResetCurrentProject = useCallback(() => {
     if (!builtInSource) return;
+    clearMasterDeck();
     setProjects((prev) =>
       prev.map((p) => (p.id === builtInSource.id ? cloneProject(builtInSource) : p))
     );
     setBeatAudios({});
     setHookVariants(null);
     setInfoNotice(`Restored "${builtInSource.name}" to its original template.`);
-  }, [builtInSource]);
+  }, [builtInSource, clearMasterDeck]);
 
   const handleGlobalPauseScaleChange = useCallback(
     (scale: number) => {
       setGlobalPauseScale(scale);
-      if (activeProject.beats.every((b) => Boolean(beatAudios[b.id]))) {
-        buildMasterFromBeatMap(activeProject.beats, beatAudios, scale, false);
+      const nonEmptyBeats = activeProject.beats.filter((b) => b.text.trim().length > 0);
+      if (
+        nonEmptyBeats.length > 0 &&
+        nonEmptyBeats.every((b) => Boolean(beatAudiosRef.current[b.id]))
+      ) {
+        buildMasterFromBeatMap(nonEmptyBeats, beatAudiosRef.current, scale, false);
       }
     },
-    [activeProject.beats, beatAudios, buildMasterFromBeatMap]
+    [activeProject.beats, buildMasterFromBeatMap]
   );
 
   const handleTogglePlayBeat = useCallback(
@@ -1118,6 +1238,7 @@ export default function App() {
 
       setErrorMessage(null);
       setStopMasterSignal((n) => n + 1);
+      const reqId = ++beatPlayRequestIdRef.current;
 
       try {
         const masteredBeat = applyAudioMastering(state.wavBytes, {
@@ -1128,6 +1249,10 @@ export default function App() {
         URL.revokeObjectURL(masteredBeat.blobUrl);
 
         const { url, isBlob } = await createPlayableAudioUrl(masteredBeat.wavBytes);
+        if (reqId !== beatPlayRequestIdRef.current) {
+          if (isBlob) URL.revokeObjectURL(url);
+          return;
+        }
 
         if (!beatHtmlAudioRef.current) {
           beatHtmlAudioRef.current = new Audio();
@@ -1144,11 +1269,16 @@ export default function App() {
           setTimeout(() => URL.revokeObjectURL(prevBlob), 1000);
         }
 
-        audio.onended = () => setPlayingBeatId(null);
+        audio.onended = () => {
+          if (reqId === beatPlayRequestIdRef.current) {
+            setPlayingBeatId(null);
+          }
+        };
         setPlayingBeatId(beatId);
 
         await audio.play();
       } catch (err: unknown) {
+        if (reqId !== beatPlayRequestIdRef.current) return;
         setPlayingBeatId(null);
         setErrorMessage(
           err instanceof Error

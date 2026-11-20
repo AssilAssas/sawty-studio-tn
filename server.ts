@@ -11,8 +11,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const DEFAULT_TTS_MODEL = 'gemini-3.8-flash-lite-tts';
-const FALLBACK_TTS_MODEL = 'gemini-3.8-flash-lite-tts';
+const ALT_TTS_MODEL = 'gemini-3.8-flash-tts';
 const SCRIPT_ASSIST_MODEL = 'gemini-4-hydrogen';
+const SCRIPT_ASSIST_FALLBACK_MODEL = 'gemini-3.1-flash-lite';
 
 const ALLOWED_MODELS = new Set([
   'gemini-3.8-flash-lite-tts',
@@ -67,6 +68,15 @@ function isDailyQuotaExhausted(status: number, message: string): boolean {
     message.includes('per day limit exceeded') ||
     message.includes('RESOURCE_EXHAUSTED')
   );
+}
+
+function safeParseModelJson<T>(rawText: string | undefined): T {
+  const cleaned = (rawText ?? '{}')
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+  return JSON.parse(cleaned || '{}') as T;
 }
 
 async function callGeminiTts(params: {
@@ -152,28 +162,88 @@ async function synthesizeWithFallback(params: {
   } catch (err: unknown) {
     const status = getErrorStatus(err);
     const message = getErrorMessage(err);
+    const alternateModel =
+      params.model === DEFAULT_TTS_MODEL ? ALT_TTS_MODEL : DEFAULT_TTS_MODEL;
 
-    if (
-      params.model !== FALLBACK_TTS_MODEL &&
-      isDailyQuotaExhausted(status, message)
-    ) {
+    if (isDailyQuotaExhausted(status, message)) {
       console.warn(
-        `[TTS Fallback] ${params.model} hit daily quota; falling back to ${FALLBACK_TTS_MODEL}.`
+        `[TTS Fallback] ${params.model} hit daily quota; falling back to ${alternateModel}.`
       );
       const fallbackResult = await callGeminiTts({
         segments: params.segments,
         voiceName: params.voiceName,
-        model: FALLBACK_TTS_MODEL,
+        model: alternateModel,
       });
       return {
         ...fallbackResult,
-        model: FALLBACK_TTS_MODEL,
+        model: alternateModel,
         fallbackFrom: params.model,
       };
     }
 
     throw err;
   }
+}
+
+async function generateScriptWithFallback(params: {
+  contents: string;
+  systemInstruction: string;
+  responseSchema: Record<string, unknown>;
+}): Promise<string | undefined> {
+  const ai = createAiClient();
+  const modelsToTry = [
+    { model: SCRIPT_ASSIST_MODEL, useThinking: true, timeoutMs: 12000 },
+    { model: SCRIPT_ASSIST_FALLBACK_MODEL, useThinking: false, timeoutMs: 20000 },
+  ];
+  let lastErr: unknown;
+
+  for (const candidate of modelsToTry) {
+    const maxAttempts = candidate.model === SCRIPT_ASSIST_FALLBACK_MODEL ? 2 : 1;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model: candidate.model,
+          contents: params.contents,
+          config: {
+            systemInstruction: params.systemInstruction,
+            ...(candidate.useThinking
+              ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+              : {}),
+            responseMimeType: 'application/json',
+            responseSchema: params.responseSchema,
+            abortSignal: AbortSignal.timeout(candidate.timeoutMs),
+          },
+        });
+        return response.text;
+      } catch (err: unknown) {
+        lastErr = err;
+        const status = getErrorStatus(err);
+        const message = getErrorMessage(err);
+        const isTimeout =
+          err instanceof Error &&
+          (err.name === 'TimeoutError' ||
+            err.name === 'AbortError' ||
+            message.toLowerCase().includes('timeout') ||
+            message.toLowerCase().includes('aborted'));
+        const isTransient = isTimeout || status >= 500 || status === 503 || status === 429;
+
+        if (attempt < maxAttempts && (status >= 500 || status === 503)) {
+          await sleep(800 * attempt);
+          continue;
+        }
+
+        if (candidate.model !== SCRIPT_ASSIST_FALLBACK_MODEL && isTransient) {
+          console.warn(
+            `[Script Assist Fallback] ${candidate.model} failed (${isTimeout ? 'timeout' : status}: ${message.slice(0, 120)}); falling back to ${SCRIPT_ASSIST_FALLBACK_MODEL}.`
+          );
+          break;
+        }
+        throw err;
+      }
+    }
+  }
+
+  throw lastErr ?? new Error('Unable to process script right now.');
 }
 
 const TUNISIAN_PHONETICS_RULE = `
@@ -237,10 +307,30 @@ async function startServer() {
 
     if (rangeHeader && rangeHeader.startsWith('bytes=')) {
       const parts = rangeHeader.replace(/^bytes=/, '').split('-');
-      const start = Math.max(0, Number.parseInt(parts[0], 10) || 0);
-      const end = parts[1]
-        ? Math.min(total - 1, Number.parseInt(parts[1], 10))
-        : total - 1;
+      const rawStart = parts[0]?.trim() ?? '';
+      const rawEnd = parts[1]?.trim() ?? '';
+
+      let start = 0;
+      let end = total - 1;
+
+      if (rawStart === '' && rawEnd !== '') {
+        // Suffix byte range: bytes=-500
+        const suffixLen = Number.parseInt(rawEnd, 10);
+        if (!Number.isFinite(suffixLen) || suffixLen <= 0) {
+          res.status(416).setHeader('Content-Range', `bytes */${total}`).end();
+          return;
+        }
+        start = Math.max(0, total - suffixLen);
+      } else {
+        const parsedStart = Number.parseInt(rawStart, 10);
+        const parsedEnd = rawEnd === '' ? total - 1 : Number.parseInt(rawEnd, 10);
+        if (!Number.isFinite(parsedStart) || !Number.isFinite(parsedEnd)) {
+          res.status(416).setHeader('Content-Range', `bytes */${total}`).end();
+          return;
+        }
+        start = Math.max(0, parsedStart);
+        end = Math.min(total - 1, parsedEnd);
+      }
 
       if (start >= total || start > end) {
         res.status(416).setHeader('Content-Range', `bytes */${total}`).end();
@@ -407,7 +497,6 @@ async function startServer() {
           ? Math.min(240, Math.max(10, Math.round(body.targetSeconds)))
           : 60;
 
-      const ai = createAiClient();
       const targetWords = Math.max(25, Math.round((targetSeconds / 60) * 145));
 
       if (mode === 'hooks') {
@@ -418,8 +507,7 @@ async function startServer() {
           return;
         }
 
-        const response = await ai.models.generateContent({
-          model: SCRIPT_ASSIST_MODEL,
+        const rawJsonText = await generateScriptWithFallback({
           contents: `Create 3 distinct, scroll-stopping opening hooks (first 3-5 seconds, ~14-24 words each) for this e-commerce ad script.
 Target language/dialect: ${dialectLabel}
 Ad format: ${formatLabel}
@@ -429,34 +517,30 @@ Current script for context:
 ${currentScript}
 
 Provide 3 clearly different angles (e.g., Curiosity Question, Pain-Point Callout, Bold Pattern-Interrupt).`,
-          config: {
-            systemInstruction: `You are a senior e-commerce direct-response copywriter and voice director. Write high-converting, spoken-word ad hooks that sound natural aloud.${TUNISIAN_PHONETICS_RULE}`,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                hooks: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      angle: { type: Type.STRING, description: 'Short hook angle label (2-4 words)' },
-                      direction: { type: Type.STRING, description: 'Concise vocal direction cue in English' },
-                      text: { type: Type.STRING, description: 'Spoken hook text in the target dialect, ready for TTS' },
-                    },
-                    required: ['angle', 'direction', 'text'],
+          systemInstruction: `You are a senior e-commerce direct-response copywriter and voice director. Write high-converting, spoken-word ad hooks that sound natural aloud.${TUNISIAN_PHONETICS_RULE}`,
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              hooks: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    angle: { type: Type.STRING, description: 'Short hook angle label (2-4 words)' },
+                    direction: { type: Type.STRING, description: 'Concise vocal direction cue in English' },
+                    text: { type: Type.STRING, description: 'Spoken hook text in the target dialect, ready for TTS' },
                   },
+                  required: ['angle', 'direction', 'text'],
                 },
               },
-              required: ['hooks'],
             },
+            required: ['hooks'],
           },
         });
 
-        const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+        const parsed = safeParseModelJson<{
           hooks?: Array<{ angle: string; direction: string; text: string }>;
-        };
+        }>(rawJsonText);
         res.json({ hooks: parsed.hooks ?? [] });
         return;
       }
@@ -514,40 +598,35 @@ Current script:
 ${currentScript}`;
         }
 
-        const response = await ai.models.generateContent({
-          model: SCRIPT_ASSIST_MODEL,
+        const rawJsonText = await generateScriptWithFallback({
           contents: prompt,
-          config: {
-            systemInstruction: `You are an elite e-commerce direct-response scriptwriter and voice-over director. Return clean JSON beats ready for immediate Text-to-Speech synthesis. Never include bracketed tags or speaker labels inside each beat's "text" field — put delivery instructions exclusively in "direction".${TUNISIAN_PHONETICS_RULE}`,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                projectTitle: {
-                  type: Type.STRING,
-                  description: 'Concise campaign title (3-6 words)',
-                },
-                beats: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      title: { type: Type.STRING, description: 'Short beat title (e.g. The Hook, Offer & CTA)' },
-                      direction: { type: Type.STRING, description: 'Actionable vocal tone, energy, and pacing cue in English' },
-                      text: { type: Type.STRING, description: 'Exact spoken copy for TTS with no bracket tags' },
-                      pauseAfterMs: { type: Type.INTEGER, description: 'Natural pause after this beat in ms (0 to 650, 0 on final beat)' },
-                    },
-                    required: ['title', 'direction', 'text', 'pauseAfterMs'],
+          systemInstruction: `You are an elite e-commerce direct-response scriptwriter and voice-over director. Return clean JSON beats ready for immediate Text-to-Speech synthesis. Never include bracketed tags or speaker labels inside each beat's "text" field — put delivery instructions exclusively in "direction".${TUNISIAN_PHONETICS_RULE}`,
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              projectTitle: {
+                type: Type.STRING,
+                description: 'Concise campaign title (3-6 words)',
+              },
+              beats: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    title: { type: Type.STRING, description: 'Short beat title (e.g. The Hook, Offer & CTA)' },
+                    direction: { type: Type.STRING, description: 'Actionable vocal tone, energy, and pacing cue in English' },
+                    text: { type: Type.STRING, description: 'Exact spoken copy for TTS with no bracket tags' },
+                    pauseAfterMs: { type: Type.INTEGER, description: 'Natural pause after this beat in ms (0 to 650, 0 on final beat)' },
                   },
+                  required: ['title', 'direction', 'text', 'pauseAfterMs'],
                 },
               },
-              required: ['projectTitle', 'beats'],
             },
+            required: ['projectTitle', 'beats'],
           },
         });
 
-        const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+        const parsed = safeParseModelJson<{
           projectTitle?: string;
           beats?: Array<{
             title: string;
@@ -555,7 +634,7 @@ ${currentScript}`;
             text: string;
             pauseAfterMs?: number;
           }>;
-        };
+        }>(rawJsonText);
 
         res.json({
           projectTitle: parsed.projectTitle || 'Untitled Ad Spot',

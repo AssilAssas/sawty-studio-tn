@@ -125,11 +125,11 @@ export const WaveformPlayer: React.FC<WaveformPlayerProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [audioUrl, generationNonce]);
 
-  // Keep <audio> volume, mute, and playback rate synced
+  // Keep <audio> volume, mute, and playback rate synced without wiping saved volume on mute
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
-    audio.volume = muted ? 0 : volume;
+    audio.volume = volume;
     audio.muted = muted;
   }, [volume, muted, audioUrl]);
 
@@ -166,6 +166,11 @@ export const WaveformPlayer: React.FC<WaveformPlayerProps> = ({
     const audio = audioRef.current;
     setPlaybackNotice(null);
     onWillStartMasterPlay?.();
+    if (audio.readyState < 1) {
+      resumeStateRef.current = { timeSec: seekRequest.timeSec, shouldPlay: true };
+      setCurrentTime(seekRequest.timeSec);
+      return;
+    }
     audio.currentTime = seekRequest.timeSec;
     setCurrentTime(seekRequest.timeSec);
     audio.play().catch(() => {
@@ -291,7 +296,7 @@ export const WaveformPlayer: React.FC<WaveformPlayerProps> = ({
     }
 
     audio.playbackRate = playbackRate;
-    audio.volume = muted ? 0 : volume;
+    audio.volume = volume;
     audio.muted = muted;
 
     const { timeSec, shouldPlay } = resumeStateRef.current;
@@ -321,7 +326,7 @@ export const WaveformPlayer: React.FC<WaveformPlayerProps> = ({
     } else {
       onWillStartMasterPlay?.();
       audio.muted = muted;
-      audio.volume = muted ? 0 : volume;
+      audio.volume = volume;
       try {
         if (audio.ended || (Number.isFinite(audio.duration) && audio.currentTime >= audio.duration - 0.05)) {
           audio.currentTime = 0;
@@ -564,8 +569,15 @@ export const WaveformPlayer: React.FC<WaveformPlayerProps> = ({
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={() => setMuted((m) => !m)}
-              aria-label={muted ? 'Unmute speaker' : 'Mute speaker'}
+              onClick={() => {
+                if (muted || volume === 0) {
+                  setMuted(false);
+                  if (volume === 0) setVolume(1.0);
+                } else {
+                  setMuted(true);
+                }
+              }}
+              aria-label={muted || volume === 0 ? 'Unmute speaker' : 'Mute speaker'}
               className="p-1.5 text-slate-600 hover:text-slate-900 rounded-md hover:bg-slate-100 transition-colors cursor-pointer"
             >
               {muted || volume === 0 ? (
@@ -634,9 +646,11 @@ export const WaveformPlayer: React.FC<WaveformPlayerProps> = ({
               if (audioRef.current) setCurrentTime(audioRef.current.currentTime);
             }}
             onVolumeChange={() => {
-              if (audioRef.current) {
-                setMuted(audioRef.current.muted);
-                setVolume(audioRef.current.volume);
+              const audio = audioRef.current;
+              if (!audio) return;
+              setMuted(audio.muted);
+              if (!audio.muted) {
+                setVolume(audio.volume);
               }
             }}
             onError={() => {

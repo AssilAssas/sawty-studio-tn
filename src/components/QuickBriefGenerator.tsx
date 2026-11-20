@@ -85,7 +85,9 @@ export const QuickBriefGenerator: React.FC<QuickBriefGeneratorProps> = ({
   const [formatId, setFormatId] = useState(defaultFormatId);
   const [styleId, setStyleId] = useState(defaultStyleId);
   const [dialectId, setDialectId] = useState(defaultDialectId);
-  const [targetSeconds, setTargetSeconds] = useState<number>(35);
+  const [targetSeconds, setTargetSeconds] = useState<number>(
+    () => AD_FORMATS.find((f) => f.id === defaultFormatId)?.targetSeconds ?? 35
+  );
 
   const handleApplySample = (sample: (typeof SAMPLE_BRIEFS)[number]) => {
     setProductName(sample.productName);

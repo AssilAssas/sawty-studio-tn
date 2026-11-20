@@ -74,7 +74,8 @@ export function parseWavBuffer(bytes: Uint8Array): ParsedWav {
       bitsPerSample = view.getUint16(offset + 22, true);
     } else if (chunkId === 'data') {
       dataOffset = offset + 8;
-      dataSize = Math.min(chunkSize, bytes.length - dataOffset);
+      const available = Math.max(0, bytes.length - dataOffset);
+      dataSize = chunkSize === 0 || chunkSize > available ? available : chunkSize;
       break;
     }
 
@@ -267,8 +268,11 @@ export function applyAudioMastering(
       lastActive--;
     }
     if (lastActive > firstActive) {
-      startIdx = Math.max(0, firstActive - padSamples);
-      endIdx = Math.min(totalSamples, lastActive + padSamples);
+      const rawStart = Math.max(0, firstActive - padSamples);
+      const rawEnd = Math.min(totalSamples, lastActive + padSamples);
+      startIdx = rawStart - (rawStart % numChannels);
+      const alignedLen = rawEnd - startIdx - ((rawEnd - startIdx) % numChannels);
+      endIdx = Math.max(startIdx + numChannels, startIdx + alignedLen);
     }
   }
 
