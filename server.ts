@@ -191,8 +191,8 @@ async function startServer() {
 
   app.use(express.json({ limit: '4mb' }));
 
-  // Lightweight in-memory LRU WAV cache so <audio> can stream real HTTPS audio with byte-range seeking
-  const MAX_CACHED_CLIPS = 16;
+  // Lightweight in-memory LRU WAV cache so <audio> streams real same-origin HTTPS audio with byte-range seeking
+  const MAX_CACHED_CLIPS = 24;
   const audioCache = new Map<string, Buffer>();
 
   const storeCachedAudio = (buffer: Buffer): string => {
@@ -231,6 +231,7 @@ async function startServer() {
     const rangeHeader = req.headers.range;
 
     res.setHeader('Content-Type', 'audio/wav');
+    res.setHeader('Content-Disposition', 'inline');
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'private, max-age=3600');
 
@@ -328,8 +329,11 @@ async function startServer() {
         model,
       });
 
+      const audioId = storeCachedAudio(Buffer.from(result.audioBase64, 'base64'));
+
       res.json({
         audioBase64: result.audioBase64,
+        audioUrl: `/api/audio/${audioId}.wav`,
         mimeType: result.mimeType,
         voiceName,
         model: result.model,

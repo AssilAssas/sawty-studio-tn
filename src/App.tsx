@@ -42,7 +42,6 @@ import {
   wavBytesToBlob,
 } from './utils/wavUtils';
 import type { StitchedBeatMarker } from './utils/wavUtils';
-import { WebAudioPcmPlayer, unlockAudioContext } from './utils/audioPlayer';
 import { WaveformPlayer } from './components/WaveformPlayer';
 import { BeatEditorRow } from './components/BeatEditorRow';
 import type { BeatAudioState } from './components/BeatEditorRow';
@@ -136,6 +135,27 @@ function normalizeBeats(
   }));
 }
 
+async function createPlayableAudioUrl(
+  wavBytes: Uint8Array
+): Promise<{ url: string; isBlob: boolean }> {
+  try {
+    const res = await fetch('/api/audio/cache', {
+      method: 'POST',
+      headers: { 'Content-Type': 'audio/wav' },
+      body: wavBytesToBlob(wavBytes),
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { url?: string };
+      if (data.url) {
+        return { url: data.url, isBlob: false };
+      }
+    }
+  } catch {
+    // Fall back to local blob URL
+  }
+  return { url: URL.createObjectURL(wavBytesToBlob(wavBytes)), isBlob: true };
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('studio');
   const [projects, setProjects] = useState<AdProject[]>(loadInitialProjects);
@@ -170,6 +190,8 @@ export default function App() {
   const [rawMasterNonce, setRawMasterNonce] = useState<number>(0);
   const [masterGenNonce, setMasterGenNonce] = useState<number>(0);
   const [stopMasterSignal, setStopMasterSignal] = useState<number>(0);
+  const [masterAudioUrl, setMasterAudioUrl] = useState<string | null>(null);
+  const masterFallbackBlobRef = useRef<string | null>(null);
   const [masterWavBytes, setMasterWavBytes] = useState<Uint8Array | null>(null);
   const [masterPeaks, setMasterPeaks] = useState<number[]>([]);
   const [masterDuration, setMasterDuration] = useState<number>(0);
@@ -187,10 +209,9 @@ export default function App() {
   const [activeTakeId, setActiveTakeId] = useState<string | null>(null);
   const takeCounterRef = useRef<number>(0);
 
-  // Beat audition players (native HTMLAudio primary + Web Audio fallback)
+  // Beat audition HTML5 audio player
   const beatHtmlAudioRef = useRef<HTMLAudioElement | null>(null);
   const beatBlobUrlRef = useRef<string | null>(null);
-  const beatPlayerRef = useRef<WebAudioPcmPlayer | null>(null);
   const [playingBeatId, setPlayingBeatId] = useState<string | null>(null);
 
   // E-com fast workflow panels
@@ -298,9 +319,10 @@ export default function App() {
     );
   }, [builtInSource, activeProject]);
 
-  // Apply real-time local loudness mastering DSP whenever rawMasterWavBytes or mastering controls change (0 API calls!)
+  // Apply real-time local loudness mastering DSP and publish a clean same-origin HTTPS audio URL (0 TTS API calls!)
   useEffect(() => {
     if (!rawMasterWavBytes) return;
+    let cancelled = false;
 
     const mastered = applyAudioMastering(rawMasterWavBytes, {
       preset: loudnessPreset,
@@ -319,13 +341,30 @@ export default function App() {
 
     URL.revokeObjectURL(mastered.blobUrl);
     setMasterWavBytes(mastered.wavBytes);
-    setMasterGenNonce(rawMasterNonce);
     setMasterPeaks(peaks);
     setMasterDuration(mastered.durationSec);
     setMasterSampleRate(mastered.sampleRate);
     setMasterPeakDbfs(mastered.peakDbfs);
     setMasterRmsDbfs(mastered.rmsDbfs);
     setMasterMarkers(shiftedMarkers);
+
+    void createPlayableAudioUrl(mastered.wavBytes).then(({ url, isBlob }) => {
+      if (cancelled) {
+        if (isBlob) URL.revokeObjectURL(url);
+        return;
+      }
+      const prevBlob = masterFallbackBlobRef.current;
+      masterFallbackBlobRef.current = isBlob ? url : null;
+      setMasterAudioUrl(url);
+      setMasterGenNonce(rawMasterNonce);
+      if (prevBlob) {
+        setTimeout(() => URL.revokeObjectURL(prevBlob), 1000);
+      }
+    });
+
+    return () => {
+      cancelled = true;
+    };
   }, [rawMasterWavBytes, rawMasterMarkers, rawMasterNonce, loudnessPreset, gainDb, trimSilence]);
 
   const stopBeatPreview = useCallback(() => {
@@ -333,15 +372,10 @@ export default function App() {
       beatHtmlAudioRef.current.pause();
       beatHtmlAudioRef.current.currentTime = 0;
     }
-    beatPlayerRef.current?.stop();
     setPlayingBeatId(null);
   }, []);
 
   useEffect(() => {
-    const player = new WebAudioPcmPlayer({
-      onEnded: () => setPlayingBeatId(null),
-    });
-    beatPlayerRef.current = player;
     return () => {
       if (beatHtmlAudioRef.current) {
         beatHtmlAudioRef.current.pause();
@@ -352,8 +386,10 @@ export default function App() {
         URL.revokeObjectURL(beatBlobUrlRef.current);
         beatBlobUrlRef.current = null;
       }
-      player.dispose();
-      beatPlayerRef.current = null;
+      if (masterFallbackBlobRef.current) {
+        URL.revokeObjectURL(masterFallbackBlobRef.current);
+        masterFallbackBlobRef.current = null;
+      }
     };
   }, []);
 
@@ -530,7 +566,6 @@ export default function App() {
 
   const handleSynthesizeSingleBeat = useCallback(
     async (beat: ScriptBeat) => {
-      void unlockAudioContext();
       setErrorMessage(null);
       setInfoNotice(null);
       setGeneratingBeatIds((prev) => ({ ...prev, [beat.id]: true }));
@@ -590,7 +625,6 @@ export default function App() {
 
   const handleGenerateMaster = useCallback(async () => {
     if (isGeneratingMaster) return;
-    void unlockAudioContext();
     setErrorMessage(null);
     setInfoNotice(null);
     stopBeatPreview();
@@ -1073,7 +1107,7 @@ export default function App() {
   );
 
   const handleTogglePlayBeat = useCallback(
-    (beatId: string) => {
+    async (beatId: string) => {
       const state = beatAudios[beatId];
       if (!state) return;
 
@@ -1082,7 +1116,6 @@ export default function App() {
         return;
       }
 
-      void unlockAudioContext();
       setErrorMessage(null);
       setStopMasterSignal((n) => n + 1);
 
@@ -1092,52 +1125,35 @@ export default function App() {
           gainDb,
           trimSilence: false,
         });
+        URL.revokeObjectURL(masteredBeat.blobUrl);
+
+        const { url, isBlob } = await createPlayableAudioUrl(masteredBeat.wavBytes);
 
         if (!beatHtmlAudioRef.current) {
           beatHtmlAudioRef.current = new Audio();
         }
         const audio = beatHtmlAudioRef.current;
         audio.pause();
-        const prevUrl = beatBlobUrlRef.current;
-        beatBlobUrlRef.current = masteredBeat.blobUrl;
-        audio.src = masteredBeat.blobUrl;
+        const prevBlob = beatBlobUrlRef.current;
+        beatBlobUrlRef.current = isBlob ? url : null;
+        audio.src = url;
         audio.volume = 1.0;
         audio.muted = false;
         audio.load();
-        if (prevUrl) {
-          URL.revokeObjectURL(prevUrl);
+        if (prevBlob) {
+          setTimeout(() => URL.revokeObjectURL(prevBlob), 1000);
         }
 
         audio.onended = () => setPlayingBeatId(null);
         setPlayingBeatId(beatId);
 
-        audio.play().catch(() => {
-          // Automatic fallback to Web Audio PCM player if native <audio> is blocked
-          const webPlayer = beatPlayerRef.current;
-          if (!webPlayer) {
-            setPlayingBeatId(null);
-            setErrorMessage('Browser blocked beat playback. Try opening the app in a new tab.');
-            return;
-          }
-          try {
-            webPlayer.loadWavBytes(masteredBeat.wavBytes, false);
-            webPlayer.play(0).catch((err: unknown) => {
-              setPlayingBeatId(null);
-              setErrorMessage(
-                err instanceof Error
-                  ? err.message
-                  : 'Browser blocked beat playback. Try opening the app in a new tab.'
-              );
-            });
-          } catch {
-            setPlayingBeatId(null);
-            setErrorMessage('Unable to play this beat inside the preview frame.');
-          }
-        });
+        await audio.play();
       } catch (err: unknown) {
         setPlayingBeatId(null);
         setErrorMessage(
-          err instanceof Error ? err.message : 'Unable to play this beat audio.'
+          err instanceof Error
+            ? err.message
+            : 'Unable to play this beat audio in your browser.'
         );
       }
     },
@@ -1148,7 +1164,6 @@ export default function App() {
     (beatId: string) => {
       const marker = masterMarkers.find((m) => m.beatId === beatId);
       if (!marker) return;
-      void unlockAudioContext();
       stopBeatPreview();
       setSeekRequest({ timeSec: marker.startSec, nonce: Date.now() });
     },
@@ -1184,7 +1199,6 @@ export default function App() {
 
   const handleLoadTake = useCallback(
     (take: SavedTake) => {
-      void unlockAudioContext();
       stopBeatPreview();
       setRawMasterWavBytes(take.rawWavBytes);
       setRawMasterMarkers(take.markers);
@@ -1397,7 +1411,7 @@ export default function App() {
                   loudnessLabel={activeLoudness.shortLabel}
                   peakDbfs={masterPeakDbfs}
                   rmsDbfs={masterRmsDbfs}
-                  wavBytes={masterWavBytes}
+                  audioUrl={masterAudioUrl}
                   generationNonce={masterGenNonce}
                   peaks={masterPeaks}
                   durationSec={masterDuration}
