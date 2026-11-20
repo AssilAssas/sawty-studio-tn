@@ -1,0 +1,6 @@
+{
+  "name": "Sawt Studio",
+  "description": "Authentic Tunisian Derja voice-over studio for directing, synthesizing, and mastering natural Arabic wellness ad narration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
