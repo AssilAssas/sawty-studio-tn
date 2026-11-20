@@ -3,6 +3,7 @@ import express from 'express';
 import type { Request, Response } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 
@@ -189,6 +190,73 @@ async function startServer() {
   const port = Number(process.env.PORT) || 3000;
 
   app.use(express.json({ limit: '4mb' }));
+
+  // Lightweight in-memory LRU WAV cache so <audio> can stream real HTTPS audio with byte-range seeking
+  const MAX_CACHED_CLIPS = 16;
+  const audioCache = new Map<string, Buffer>();
+
+  const storeCachedAudio = (buffer: Buffer): string => {
+    const id = crypto.randomBytes(10).toString('hex');
+    audioCache.set(id, buffer);
+    if (audioCache.size > MAX_CACHED_CLIPS) {
+      const oldestKey = audioCache.keys().next().value;
+      if (oldestKey) audioCache.delete(oldestKey);
+    }
+    return id;
+  };
+
+  app.post(
+    '/api/audio/cache',
+    express.raw({ type: ['audio/wav', 'application/octet-stream'], limit: '30mb' }),
+    (req: Request, res: Response) => {
+      const buf = req.body;
+      if (!Buffer.isBuffer(buf) || buf.length <= 44) {
+        res.status(400).json({ error: 'Valid WAV audio payload is required.' });
+        return;
+      }
+      const id = storeCachedAudio(buf);
+      res.json({ id, url: `/api/audio/${id}.wav` });
+    }
+  );
+
+  app.get('/api/audio/:id.wav', (req: Request, res: Response) => {
+    const id = String(req.params.id || '').replace(/[^a-f0-9]/gi, '');
+    const buf = audioCache.get(id);
+    if (!buf) {
+      res.status(404).send('Audio clip expired or not found.');
+      return;
+    }
+
+    const total = buf.length;
+    const rangeHeader = req.headers.range;
+
+    res.setHeader('Content-Type', 'audio/wav');
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+
+    if (rangeHeader && rangeHeader.startsWith('bytes=')) {
+      const parts = rangeHeader.replace(/^bytes=/, '').split('-');
+      const start = Math.max(0, Number.parseInt(parts[0], 10) || 0);
+      const end = parts[1]
+        ? Math.min(total - 1, Number.parseInt(parts[1], 10))
+        : total - 1;
+
+      if (start >= total || start > end) {
+        res.status(416).setHeader('Content-Range', `bytes */${total}`).end();
+        return;
+      }
+
+      const chunk = buf.subarray(start, end + 1);
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+      res.setHeader('Content-Length', String(chunk.length));
+      res.end(chunk);
+      return;
+    }
+
+    res.setHeader('Content-Length', String(total));
+    res.status(200).end(buf);
+  });
 
   app.get('/api/health', (_req: Request, res: Response) => {
     res.json({ ok: true });

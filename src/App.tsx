@@ -42,6 +42,7 @@ import {
   wavBytesToBlob,
 } from './utils/wavUtils';
 import type { StitchedBeatMarker } from './utils/wavUtils';
+import { WebAudioPcmPlayer, unlockAudioContext } from './utils/audioPlayer';
 import { WaveformPlayer } from './components/WaveformPlayer';
 import { BeatEditorRow } from './components/BeatEditorRow';
 import type { BeatAudioState } from './components/BeatEditorRow';
@@ -166,7 +167,9 @@ export default function App() {
   } | null>(null);
   const [rawMasterWavBytes, setRawMasterWavBytes] = useState<Uint8Array | null>(null);
   const [rawMasterMarkers, setRawMasterMarkers] = useState<StitchedBeatMarker[]>([]);
-  const [masterAudioUrl, setMasterAudioUrl] = useState<string | null>(null);
+  const [rawMasterNonce, setRawMasterNonce] = useState<number>(0);
+  const [masterGenNonce, setMasterGenNonce] = useState<number>(0);
+  const [stopMasterSignal, setStopMasterSignal] = useState<number>(0);
   const [masterWavBytes, setMasterWavBytes] = useState<Uint8Array | null>(null);
   const [masterPeaks, setMasterPeaks] = useState<number[]>([]);
   const [masterDuration, setMasterDuration] = useState<number>(0);
@@ -184,8 +187,10 @@ export default function App() {
   const [activeTakeId, setActiveTakeId] = useState<string | null>(null);
   const takeCounterRef = useRef<number>(0);
 
-  // Beat audition audio element
-  const beatAudioRef = useRef<HTMLAudioElement | null>(null);
+  // Beat audition players (native HTMLAudio primary + Web Audio fallback)
+  const beatHtmlAudioRef = useRef<HTMLAudioElement | null>(null);
+  const beatBlobUrlRef = useRef<string | null>(null);
+  const beatPlayerRef = useRef<WebAudioPcmPlayer | null>(null);
   const [playingBeatId, setPlayingBeatId] = useState<string | null>(null);
 
   // E-com fast workflow panels
@@ -312,32 +317,43 @@ export default function App() {
       ),
     }));
 
-    setMasterAudioUrl((prevUrl) => {
-      if (prevUrl) URL.revokeObjectURL(prevUrl);
-      return mastered.blobUrl;
-    });
+    URL.revokeObjectURL(mastered.blobUrl);
     setMasterWavBytes(mastered.wavBytes);
+    setMasterGenNonce(rawMasterNonce);
     setMasterPeaks(peaks);
     setMasterDuration(mastered.durationSec);
     setMasterSampleRate(mastered.sampleRate);
     setMasterPeakDbfs(mastered.peakDbfs);
     setMasterRmsDbfs(mastered.rmsDbfs);
     setMasterMarkers(shiftedMarkers);
-  }, [rawMasterWavBytes, rawMasterMarkers, loudnessPreset, gainDb, trimSilence]);
+  }, [rawMasterWavBytes, rawMasterMarkers, rawMasterNonce, loudnessPreset, gainDb, trimSilence]);
 
   const stopBeatPreview = useCallback(() => {
-    if (beatAudioRef.current) {
-      beatAudioRef.current.pause();
-      beatAudioRef.current.currentTime = 0;
+    if (beatHtmlAudioRef.current) {
+      beatHtmlAudioRef.current.pause();
+      beatHtmlAudioRef.current.currentTime = 0;
     }
+    beatPlayerRef.current?.stop();
     setPlayingBeatId(null);
   }, []);
 
   useEffect(() => {
+    const player = new WebAudioPcmPlayer({
+      onEnded: () => setPlayingBeatId(null),
+    });
+    beatPlayerRef.current = player;
     return () => {
-      if (beatAudioRef.current) {
-        beatAudioRef.current.pause();
+      if (beatHtmlAudioRef.current) {
+        beatHtmlAudioRef.current.pause();
+        beatHtmlAudioRef.current.removeAttribute('src');
+        beatHtmlAudioRef.current = null;
       }
+      if (beatBlobUrlRef.current) {
+        URL.revokeObjectURL(beatBlobUrlRef.current);
+        beatBlobUrlRef.current = null;
+      }
+      player.dispose();
+      beatPlayerRef.current = null;
     };
   }, []);
 
@@ -497,6 +513,7 @@ export default function App() {
       setRawMasterMarkers(stitched.markers);
 
       if (shouldRecordTake) {
+        setRawMasterNonce((n) => n + 1);
         recordTake({
           rawBytes: stitched.wavBytes,
           markers: stitched.markers,
@@ -513,6 +530,7 @@ export default function App() {
 
   const handleSynthesizeSingleBeat = useCallback(
     async (beat: ScriptBeat) => {
+      void unlockAudioContext();
       setErrorMessage(null);
       setInfoNotice(null);
       setGeneratingBeatIds((prev) => ({ ...prev, [beat.id]: true }));
@@ -572,6 +590,7 @@ export default function App() {
 
   const handleGenerateMaster = useCallback(async () => {
     if (isGeneratingMaster) return;
+    void unlockAudioContext();
     setErrorMessage(null);
     setInfoNotice(null);
     stopBeatPreview();
@@ -620,6 +639,7 @@ export default function App() {
 
         setRawMasterWavBytes(wavBytes);
         setRawMasterMarkers(estimatedMarkers);
+        setRawMasterNonce((n) => n + 1);
         recordTake({
           rawBytes: wavBytes,
           markers: estimatedMarkers,
@@ -1062,27 +1082,73 @@ export default function App() {
         return;
       }
 
-      if (!beatAudioRef.current) {
-        beatAudioRef.current = new Audio();
-      }
+      void unlockAudioContext();
+      setErrorMessage(null);
+      setStopMasterSignal((n) => n + 1);
 
-      const audio = beatAudioRef.current;
-      audio.pause();
-      audio.src = state.blobUrl;
-      audio.onended = () => setPlayingBeatId(null);
-      audio.onpause = () => setPlayingBeatId(null);
-      audio
-        .play()
-        .then(() => setPlayingBeatId(beatId))
-        .catch(() => setPlayingBeatId(null));
+      try {
+        const masteredBeat = applyAudioMastering(state.wavBytes, {
+          preset: loudnessPreset,
+          gainDb,
+          trimSilence: false,
+        });
+
+        if (!beatHtmlAudioRef.current) {
+          beatHtmlAudioRef.current = new Audio();
+        }
+        const audio = beatHtmlAudioRef.current;
+        audio.pause();
+        const prevUrl = beatBlobUrlRef.current;
+        beatBlobUrlRef.current = masteredBeat.blobUrl;
+        audio.src = masteredBeat.blobUrl;
+        audio.volume = 1.0;
+        audio.muted = false;
+        audio.load();
+        if (prevUrl) {
+          URL.revokeObjectURL(prevUrl);
+        }
+
+        audio.onended = () => setPlayingBeatId(null);
+        setPlayingBeatId(beatId);
+
+        audio.play().catch(() => {
+          // Automatic fallback to Web Audio PCM player if native <audio> is blocked
+          const webPlayer = beatPlayerRef.current;
+          if (!webPlayer) {
+            setPlayingBeatId(null);
+            setErrorMessage('Browser blocked beat playback. Try opening the app in a new tab.');
+            return;
+          }
+          try {
+            webPlayer.loadWavBytes(masteredBeat.wavBytes, false);
+            webPlayer.play(0).catch((err: unknown) => {
+              setPlayingBeatId(null);
+              setErrorMessage(
+                err instanceof Error
+                  ? err.message
+                  : 'Browser blocked beat playback. Try opening the app in a new tab.'
+              );
+            });
+          } catch {
+            setPlayingBeatId(null);
+            setErrorMessage('Unable to play this beat inside the preview frame.');
+          }
+        });
+      } catch (err: unknown) {
+        setPlayingBeatId(null);
+        setErrorMessage(
+          err instanceof Error ? err.message : 'Unable to play this beat audio.'
+        );
+      }
     },
-    [beatAudios, playingBeatId, stopBeatPreview]
+    [beatAudios, playingBeatId, stopBeatPreview, loudnessPreset, gainDb]
   );
 
   const handleSeekInMaster = useCallback(
     (beatId: string) => {
       const marker = masterMarkers.find((m) => m.beatId === beatId);
       if (!marker) return;
+      void unlockAudioContext();
       stopBeatPreview();
       setSeekRequest({ timeSec: marker.startSec, nonce: Date.now() });
     },
@@ -1116,13 +1182,18 @@ export default function App() {
     [beatAudios, loudnessPreset, gainDb, trimSilence, activeVoice.name]
   );
 
-  const handleLoadTake = useCallback((take: SavedTake) => {
-    setRawMasterWavBytes(take.rawWavBytes);
-    setRawMasterMarkers(take.markers);
-    setActiveTakeId(take.id);
-    setActiveTab('studio');
-    setSeekRequest({ timeSec: 0, nonce: Date.now() });
-  }, []);
+  const handleLoadTake = useCallback(
+    (take: SavedTake) => {
+      void unlockAudioContext();
+      stopBeatPreview();
+      setRawMasterWavBytes(take.rawWavBytes);
+      setRawMasterMarkers(take.markers);
+      setRawMasterNonce((n) => n + 1);
+      setActiveTakeId(take.id);
+      setActiveTab('studio');
+    },
+    [stopBeatPreview]
+  );
 
   const handleDeleteTake = useCallback(
     (takeId: string) => {
@@ -1326,7 +1397,8 @@ export default function App() {
                   loudnessLabel={activeLoudness.shortLabel}
                   peakDbfs={masterPeakDbfs}
                   rmsDbfs={masterRmsDbfs}
-                  audioUrl={masterAudioUrl}
+                  wavBytes={masterWavBytes}
+                  generationNonce={masterGenNonce}
                   peaks={masterPeaks}
                   durationSec={masterDuration}
                   sampleRate={masterSampleRate}
@@ -1337,6 +1409,8 @@ export default function App() {
                   onActiveBeatChange={setActiveBeatId}
                   onGenerateMaster={handleGenerateMaster}
                   onDownloadMaster={handleDownloadMaster}
+                  onWillStartMasterPlay={stopBeatPreview}
+                  stopMasterSignal={stopMasterSignal}
                   seekRequest={seekRequest}
                   totalWordCount={totalWordCount}
                   beatCount={activeProject.beats.length}
